@@ -4,16 +4,20 @@ import time
 import html
 import json
 import os
+import threading
 from bs4 import BeautifulSoup
 from itertools import product
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # ===== 설정값 =====
 MAX_WORKERS = 5  # 동시 요청 수
 TIMEOUT_SEC = 30 
 MIN_EXPECTED_MAPS = 30
 POST_RETRY_ROUNDS = 5
+HTTP_RETRIES = 5
 
 DEFAULT_MAPS = [
     "all-maps", "volskaya-industries", "temple-of-anubis", "hanamura",
@@ -23,6 +27,42 @@ DEFAULT_MAPS = [
     "suravasa", "aatlis", "numbani", "midtown", "blizzard-world", "eichenwalde",
     "kings-row", "paraiso", "hollywood", "new-queen-street", "runasapi", "esperanca", "colosseo"
 ]
+
+_thread_local = threading.local()
+
+def create_session():
+    retry = Retry(
+        total=HTTP_RETRIES,
+        connect=HTTP_RETRIES,
+        read=HTTP_RETRIES,
+        status=HTTP_RETRIES,
+        backoff_factor=0.6,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=MAX_WORKERS * 2, pool_maxsize=MAX_WORKERS * 4)
+
+    session = requests.Session()
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update(
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        }
+    )
+    return session
+
+def get_session():
+    if not hasattr(_thread_local, "session"):
+        _thread_local.session = create_session()
+    return _thread_local.session
 
 # ===== 맵 목록 파싱 =====
 def fetch_maps_from_web():
@@ -129,6 +169,16 @@ def load_maps():
     print("⚠️ 기본 하드코딩된 맵 목록 사용")
     return DEFAULT_MAPS
 
+def _has_selected_option(soup, value):
+    options = soup.find_all("option", {"value": str(value)})
+    if not options:
+        return False
+    return any(option.has_attr("selected") for option in options)
+
+def _can_validate_selected_options(soup):
+    options = soup.find_all("option")
+    return any(option.has_attr("selected") for option in options)
+
 def scrape_single_url(args):
     region, input_gamemode, map_name, tier, date_str = args
     
@@ -150,7 +200,7 @@ def scrape_single_url(args):
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                res = requests.get(target_url, timeout=TIMEOUT_SEC)
+                res = get_session().get(target_url, timeout=TIMEOUT_SEC)
                 res.raise_for_status()
 
                 soup = BeautifulSoup(res.text, "html.parser")
@@ -159,23 +209,18 @@ def scrape_single_url(args):
                 # 🛡️ HTML 태그(Select Option) 3중 검증
                 # ================================================================
 
-                # [1] 게임 모드 검증 (현재 시도 중인 모드와 일치하는지 확인)
-                selected_gamemode = soup.find("option", {"value": str(current_gamemode), "selected": True})
-                if not selected_gamemode:
-                    # 검증 실패 시, 다음 시도(retries)가 아니라 다음 모드(modes_to_try)로 넘어가야 하므로
-                    # 여기서는 빈 리스트 반환하고 loop break 유도
-                    break 
-
-                # [2] 맵 검증
-                if map_name != "all-maps":
-                    selected_map = soup.find("option", {"value": map_name, "selected": True})
-                    if not selected_map:
+                # selected 속성이 없으면 사이트 구조로 판단하고 검증 스킵
+                if _can_validate_selected_options(soup):
+                    # [1] 게임 모드 검증 (현재 시도 중인 모드와 일치하는지 확인)
+                    if not _has_selected_option(soup, current_gamemode):
                         break
 
-                # [3] 티어 검증
-                if tier != "All":
-                    selected_tier = soup.find("option", {"value": tier, "selected": True})
-                    if not selected_tier:
+                    # [2] 맵 검증
+                    if map_name != "all-maps" and not _has_selected_option(soup, map_name):
+                        break
+
+                    # [3] 티어 검증
+                    if tier != "All" and not _has_selected_option(soup, tier):
                         break
                 
                 # ================================================================
@@ -222,11 +267,17 @@ def scrape_single_url(args):
         # 여기까지 왔다는 건, 현재 current_gamemode로는 실패했다는 뜻
         # 다음 modes_to_try로 넘어감 (예: 2 실패 -> 1 시도)
 
+    print(f"⚠️ 요청 실패: region={region} mode={input_gamemode} map={map_name} tier={tier}")
     return []
 
 def task_to_mode_str(task):
     _, gamemode, _, _, _ = task
     return "competitive" if gamemode == 2 else "quickplay"
+
+def format_task(task):
+    region, gamemode, map_name, tier, _ = task
+    mode = "competitive" if gamemode == 2 else "quickplay"
+    return f"region={region} mode={mode} map={map_name} tier={tier}"
 
 def build_expected_heroes_by_mode(task_results):
     expected = {"quickplay": set(), "competitive": set()}
@@ -262,10 +313,14 @@ def find_retry_tasks(task_results, expected_heroes_by_mode):
             continue
 
         actual = {r.get("hero", "") for r in records if r.get("hero")}
-        if len(actual) < len(expected):
+        # 부분 누락(영웅 일부 누락)만 재시도 대상으로 분류
+        if 0 < len(actual) < len(expected):
             retry_tasks.append(task)
 
     return retry_tasks
+
+def find_no_data_tasks(task_results):
+    return [task for task, records in task_results.items() if not records]
 
 def main():
     # ===== 0. 기본 설정 =====
@@ -333,6 +388,14 @@ def main():
         # ===== 2-1. 누락 영웅 후속 재시도 =====
         expected_heroes_by_mode = build_expected_heroes_by_mode(task_results)
         retry_tasks = find_retry_tasks(task_results, expected_heroes_by_mode)
+        no_data_tasks = find_no_data_tasks(task_results)
+
+        if no_data_tasks:
+            print(f"🗂️ {region} 데이터 없음 조합 {len(no_data_tasks)}건 분류 완료")
+            for task in no_data_tasks[:10]:
+                print(f"    ↳ 데이터 없음: {format_task(task)}")
+            if len(no_data_tasks) > 10:
+                print(f"    ↳ ... 외 {len(no_data_tasks) - 10}건")
 
         if retry_tasks:
             print(f"🔁 {region} 누락 의심 조합 {len(retry_tasks)}건 후속 재시도 시작")
