@@ -4,26 +4,16 @@ import time
 import html
 import json
 import os
-import random
-import threading
 from bs4 import BeautifulSoup
 from itertools import product
 from datetime import datetime
-from urllib.parse import urlparse, parse_qs
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 # ===== 설정값 =====
 MAX_WORKERS = 5  # 동시 요청 수
 TIMEOUT_SEC = 30 
 MIN_EXPECTED_MAPS = 30
 POST_RETRY_ROUNDS = 5
-EMPTY_TASK_RETRY_ROUNDS = 2
-HTTP_RETRIES = 5
-MIN_HERO_ROWS_PER_RESPONSE = 15
-PARTIAL_MISSING_MAX_RETRIES_PER_TASK = 12
-PARTIAL_MISSING_STAGNATION_LIMIT = 4
 
 DEFAULT_MAPS = [
     "all-maps", "volskaya-industries", "temple-of-anubis", "hanamura",
@@ -33,88 +23,6 @@ DEFAULT_MAPS = [
     "suravasa", "aatlis", "numbani", "midtown", "blizzard-world", "eichenwalde",
     "kings-row", "paraiso", "hollywood", "new-queen-street", "runasapi", "esperanca", "colosseo"
 ]
-
-_thread_local = threading.local()
-
-def create_session():
-    retry = Retry(
-        total=HTTP_RETRIES,
-        connect=HTTP_RETRIES,
-        read=HTTP_RETRIES,
-        status=HTTP_RETRIES,
-        backoff_factor=0.6,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(["GET"]),
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=MAX_WORKERS * 2, pool_maxsize=MAX_WORKERS * 4)
-
-    session = requests.Session()
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    session.headers.update(
-        {
-            "User-Agent": (
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-        }
-    )
-    return session
-
-def get_session():
-    if not hasattr(_thread_local, "session"):
-        _thread_local.session = create_session()
-    return _thread_local.session
-
-def _has_selected_option(soup, value):
-    options = soup.find_all("option", {"value": str(value)})
-    if not options:
-        return False
-    return any(option.has_attr("selected") for option in options)
-
-def _can_validate_selected_options(soup):
-    options = soup.find_all("option")
-    return any(option.has_attr("selected") for option in options)
-
-def _validate_response_filters(soup, current_gamemode, map_name, tier):
-    # selected 속성이 아예 없으면 구조 변경으로 판단하고 검증을 스킵
-    if not _can_validate_selected_options(soup):
-        return True
-
-    if not _has_selected_option(soup, current_gamemode):
-        return False
-
-    if map_name != "all-maps" and not _has_selected_option(soup, map_name):
-        return False
-
-    if tier != "All" and not _has_selected_option(soup, tier):
-        return False
-
-    return True
-
-def _extract_rows_json(soup):
-    tag = soup.find("blz-data-table")
-    if not tag:
-        tag = soup.find(attrs={"allrows": True})
-    if not tag or "allrows" not in tag.attrs:
-        return []
-
-    try:
-        raw_json = html.unescape(tag["allrows"])
-        data = json.loads(raw_json)
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
-
-def _query_value_from_url(url, key):
-    parsed = urlparse(url)
-    params = parse_qs(parsed.query)
-    values = params.get(key, [])
-    return values[0] if values else ""
 
 # ===== 맵 목록 파싱 =====
 def fetch_maps_from_web():
@@ -229,8 +137,6 @@ def scrape_single_url(args):
     # 그 외(빠른대전 0 등)는 원래 값만 시도
     modes_to_try = [2, 1] if input_gamemode == 2 else [input_gamemode]
 
-    best_records = []
-
     # 설정된 모드 후보들을 순차적으로 시도
     for current_gamemode in modes_to_try:
         records = []
@@ -241,27 +147,49 @@ def scrape_single_url(args):
         params = f"?input=pc&map={map_name}&region={region}&role=All&rq={current_gamemode}&tier={tier}"
         target_url = base_url + params
 
-        max_retries = 5
+        max_retries = 3
         for attempt in range(max_retries):
             try:
-                session = get_session()
-                res = session.get(target_url, timeout=TIMEOUT_SEC)
+                res = requests.get(target_url, timeout=TIMEOUT_SEC)
                 res.raise_for_status()
 
                 soup = BeautifulSoup(res.text, "html.parser")
 
-                if "내부 서버 오류" in res.text or "Internal Server Error" in res.text:
-                    raise RuntimeError("server error page detected")
+                # ================================================================
+                # 🛡️ HTML 태그(Select Option) 3중 검증
+                # ================================================================
 
-                if not _validate_response_filters(soup, current_gamemode, map_name, tier):
-                    # 캐시/서버 지연으로 다른 필터 응답이 올 수 있어 재시도
-                    time.sleep(0.7 + attempt * 0.4)
-                    continue
+                # [1] 게임 모드 검증 (현재 시도 중인 모드와 일치하는지 확인)
+                selected_gamemode = soup.find("option", {"value": str(current_gamemode), "selected": True})
+                if not selected_gamemode:
+                    # 검증 실패 시, 다음 시도(retries)가 아니라 다음 모드(modes_to_try)로 넘어가야 하므로
+                    # 여기서는 빈 리스트 반환하고 loop break 유도
+                    break 
 
-                data = _extract_rows_json(soup)
-                if not data:
-                    time.sleep(0.7 + attempt * 0.4)
-                    continue
+                # [2] 맵 검증
+                if map_name != "all-maps":
+                    selected_map = soup.find("option", {"value": map_name, "selected": True})
+                    if not selected_map:
+                        break
+
+                # [3] 티어 검증
+                if tier != "All":
+                    selected_tier = soup.find("option", {"value": tier, "selected": True})
+                    if not selected_tier:
+                        break
+                
+                # ================================================================
+
+                # 데이터 추출
+                tag = soup.find("blz-data-table")
+                if not tag:
+                    break
+
+                raw_json = html.unescape(tag["allrows"])
+                data = json.loads(raw_json)
+
+                if not data: 
+                    break
 
                 for hero in data:
                     cells = hero.get("cells", {})
@@ -278,34 +206,21 @@ def scrape_single_url(args):
                         "pick_rate": cells.get("pickrate", ""),
                         "win_rate": cells.get("winrate", "")
                     })
-
-                if len(records) > len(best_records):
-                    best_records = records
-
-                if len(records) >= MIN_HERO_ROWS_PER_RESPONSE:
-                    return records
-
-                time.sleep(0.2 + random.uniform(0.0, 0.2))
+                
+                time.sleep(0.1)
+                
+                # 데이터를 성공적으로 찾았으면 즉시 반환 (더 이상 다른 모드/재시도 불필요)
+                return records
 
             except Exception as e:
                 if attempt < max_retries - 1:
-                    time.sleep(1.0 + attempt * 0.5 + random.uniform(0.0, 0.4))
+                    time.sleep(1)
                 else:
-                    pass
+                    pass # 마지막 시도 실패 시 다음 로직으로 이동
 
-        if len(records) > len(best_records):
-            best_records = records
-
-    if best_records:
-        return best_records
-
-    print(
-        "⚠️ 요청 실패:",
-        f"region={region}",
-        f"mode={input_gamemode}",
-        f"map={_query_value_from_url(target_url, 'map')}",
-        f"tier={_query_value_from_url(target_url, 'tier')}",
-    )
+        # 만약 records가 채워졌다면 루프 종료 및 반환 (위의 return records가 처리함)
+        # 여기까지 왔다는 건, 현재 current_gamemode로는 실패했다는 뜻
+        # 다음 modes_to_try로 넘어감 (예: 2 실패 -> 1 시도)
 
     return []
 
@@ -351,67 +266,6 @@ def find_retry_tasks(task_results, expected_heroes_by_mode):
             retry_tasks.append(task)
 
     return retry_tasks
-
-def find_empty_tasks(task_results):
-    return [task for task, records in task_results.items() if not records]
-
-def retry_partial_missing_tasks(task_results):
-    expected_heroes_by_mode = build_expected_heroes_by_mode(task_results)
-    pending_tasks = find_retry_tasks(task_results, expected_heroes_by_mode)
-    if not pending_tasks:
-        return
-
-    print(f"🔁 일부 영웅 누락 조합 {len(pending_tasks)}건 추적 재시도 시작")
-
-    retry_counts = {task: 0 for task in pending_tasks}
-    stagnation_counts = {task: 0 for task in pending_tasks}
-    round_idx = 0
-
-    while pending_tasks:
-        round_idx += 1
-
-        runnable_tasks = [
-            task for task in pending_tasks
-            if retry_counts.get(task, 0) < PARTIAL_MISSING_MAX_RETRIES_PER_TASK
-            and stagnation_counts.get(task, 0) < PARTIAL_MISSING_STAGNATION_LIMIT
-        ]
-
-        if not runnable_tasks:
-            print("    ↳ 재시도 한도 도달로 일부 누락 조합 종료")
-            break
-
-        print(f"    ↳ 누락 재시도 라운드 {round_idx}: {len(runnable_tasks)}건")
-
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            future_to_task = {executor.submit(scrape_single_url, t): t for t in runnable_tasks}
-
-            for future in as_completed(future_to_task):
-                task = future_to_task[future]
-                retry_counts[task] = retry_counts.get(task, 0) + 1
-
-                try:
-                    new_data = future.result() or []
-                except Exception:
-                    new_data = []
-
-                old_data = task_results.get(task, [])
-                old_heroes = {r.get("hero", "") for r in old_data if r.get("hero")}
-                new_heroes = {r.get("hero", "") for r in new_data if r.get("hero")}
-
-                if len(new_heroes) > len(old_heroes):
-                    task_results[task] = new_data
-                    stagnation_counts[task] = 0
-                else:
-                    stagnation_counts[task] = stagnation_counts.get(task, 0) + 1
-
-        expected_heroes_by_mode = build_expected_heroes_by_mode(task_results)
-        pending_tasks = find_retry_tasks(task_results, expected_heroes_by_mode)
-
-    remaining = len(pending_tasks)
-    if remaining:
-        print(f"    ↳ 일부 누락 조합 {remaining}건은 한도 도달로 종료")
-    else:
-        print("    ↳ 일부 영웅 누락 조합 복구 완료")
 
 def main():
     # ===== 0. 기본 설정 =====
@@ -476,23 +330,22 @@ def main():
                 if (i + 1) % 50 == 0:
                     print(f"    ... {i + 1}/{len(tasks)} 완료")
 
-        # ===== 2-1. 누락 영웅 후속 추적 재시도 =====
-        retry_partial_missing_tasks(task_results)
+        # ===== 2-1. 누락 영웅 후속 재시도 =====
+        expected_heroes_by_mode = build_expected_heroes_by_mode(task_results)
+        retry_tasks = find_retry_tasks(task_results, expected_heroes_by_mode)
 
-        # ===== 2-2. 완전 누락 조합 후속 재시도 =====
-        empty_tasks = find_empty_tasks(task_results)
-        if empty_tasks:
-            print(f"🧩 {region} 완전 누락 조합 {len(empty_tasks)}건 보강 재시도 시작")
+        if retry_tasks:
+            print(f"🔁 {region} 누락 의심 조합 {len(retry_tasks)}건 후속 재시도 시작")
 
-        for round_idx in range(1, EMPTY_TASK_RETRY_ROUNDS + 1):
-            if not empty_tasks:
+        for round_idx in range(1, POST_RETRY_ROUNDS + 1):
+            if not retry_tasks:
                 break
 
-            print(f"    ↳ 누락 보강 라운드 {round_idx}: {len(empty_tasks)}건")
-            recovered_count = 0
+            print(f"    ↳ 재시도 라운드 {round_idx}: {len(retry_tasks)}건")
+            improved_count = 0
 
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                future_to_task = {executor.submit(scrape_single_url, t): t for t in empty_tasks}
+                future_to_task = {executor.submit(scrape_single_url, t): t for t in retry_tasks}
 
                 for future in as_completed(future_to_task):
                     task = future_to_task[future]
@@ -501,13 +354,19 @@ def main():
                     except Exception:
                         new_data = []
 
-                    if new_data:
-                        task_results[task] = new_data
-                        recovered_count += 1
+                    old_data = task_results.get(task, [])
+                    old_heroes = {r.get("hero", "") for r in old_data if r.get("hero")}
+                    new_heroes = {r.get("hero", "") for r in new_data if r.get("hero")}
 
-            empty_tasks = find_empty_tasks(task_results)
-            if recovered_count == 0:
-                print("    ↳ 복구된 조합 없음, 누락 보강 종료")
+                    if len(new_heroes) > len(old_heroes):
+                        task_results[task] = new_data
+                        improved_count += 1
+
+            expected_heroes_by_mode = build_expected_heroes_by_mode(task_results)
+            retry_tasks = find_retry_tasks(task_results, expected_heroes_by_mode)
+
+            if improved_count == 0:
+                print("    ↳ 추가 개선 없음, 재시도 종료")
                 break
 
         region_records = []
