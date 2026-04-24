@@ -13,20 +13,14 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # ===== 설정값 =====
-MAX_WORKERS = 5  # 동시 요청 수
-TIMEOUT_SEC = 30 
-MIN_EXPECTED_MAPS = 30
+MAX_WORKERS = 5
+TIMEOUT_SEC = 30
 POST_RETRY_ROUNDS = 5
 HTTP_RETRIES = 5
 
-DEFAULT_MAPS = [
-    "all-maps", "volskaya-industries", "temple-of-anubis", "hanamura",
-    "throne-of-anubis", "hanaoka", "antarctic-peninsula", "nepal", "lijiang-tower",
-    "busan", "samoa", "oasis", "ilios", "route-66", "watchpoint-gibraltar", "dorado",
-    "rialto", "shambali-monastery", "circuit-royal", "junkertown", "havana", "new-junk-city",
-    "suravasa", "aatlis", "numbani", "midtown", "blizzard-world", "eichenwalde",
-    "kings-row", "paraiso", "hollywood", "new-queen-street", "runasapi", "esperanca", "colosseo"
-]
+BASE_URL = "https://overwatch.blizzard.com/ko-kr/rates/"
+REGIONS = ["Americas", "Europe", "Asia"]
+TIERS = ["All", "Bronze", "Silver", "Gold", "Platinum", "Diamond", "Master", "Grandmaster"]
 
 _thread_local = threading.local()
 
@@ -64,110 +58,47 @@ def get_session():
         _thread_local.session = create_session()
     return _thread_local.session
 
-# ===== 맵 목록 파싱 =====
-def fetch_maps_from_web():
+# ===== 맵 목록 동적 파싱 =====
+def fetch_maps_dynamic():
     """
-    오버워치 사이트에서 맵 목록을 파싱하여 반환
+    오버워치 사이트의 filter-map-select에서 맵 목록을 직접 파싱하여 반환.
+    maps.json에 파싱 결과를 기록(참고용)하되, 캐시로 사용하지 않음.
     """
-    try:
-        print("🗺️  웹사이트에서 맵 목록 파싱 중...")
-        url = "https://overwatch.blizzard.com/ko-kr/rates/"
-        res = requests.get(url, timeout=TIMEOUT_SEC)
-        res.raise_for_status()
-        
-        soup = BeautifulSoup(res.text, "html.parser")
-        
-        # 맵 선택 옵션 찾기
-        map_select = soup.find("select", {"id": "filter-map-select"})
-        if not map_select:
-            map_select = soup.find("select", {"name": "filter-map-select"})
+    print("🗺️  웹사이트에서 맵 목록 동적 파싱 중...")
+    res = requests.get(BASE_URL, timeout=TIMEOUT_SEC)
+    res.raise_for_status()
 
-        if map_select:
-            map_options = map_select.find_all("option", {"data-title": True})
-        else:
-            map_options = soup.find_all("option", {"data-title": True})
-        
-        maps = []
-        for option in map_options:
-            # value가 있고 data-title이 있는 맵 옵션만 추출
-            map_value = option.get("value")
-            map_title = option.get("data-title")
-            
-            if map_value and map_title:
-                # 맵 선택 드롭다운의 옵션들만 (게임모드나 다른 드롭다운 제외)
-                # parent select 태그 확인하여 맵 관련인지 체크
-                parent = option.find_parent("select")
-                if not parent or "map" in (parent.get("name", "") + parent.get("id", "")).lower():
-                    maps.append({
-                        "value": map_value,
-                        "title": map_title
-                    })
-        
-        # 간단한 방법: value 속성으로 맵 관련 옵션인지 판단
-        # (맵은 보통 하이픈으로 연결된 문자열)
-        if not maps:
-            # parent 체크가 안되면 value 패턴으로 필터링
-            maps = [
-                {"value": opt.get("value"), "title": opt.get("data-title")}
-                for opt in map_options
-                if opt.get("value") and "-" in opt.get("value", "")
-            ]
-        
-        map_values = [m["value"] for m in maps]
-        print(f"✅ {len(map_values)}개 맵 파싱 완료")
-        
-        # 맵 정보 저장
-        maps_data = {
-            "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "maps": maps,
-            "map_values": map_values
-        }
-        
-        maps_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "maps.json")
-        with open(maps_file, "w", encoding="utf-8") as f:
-            json.dump(maps_data, f, ensure_ascii=False, indent=2)
-        print(f"💾 맵 정보 저장: {maps_file}")
-        
-        return map_values
-        
-    except Exception as e:
-        print(f"⚠️ 맵 파싱 실패: {e}")
-        print("기본 맵 목록 사용")
-        return None
+    soup = BeautifulSoup(res.text, "html.parser")
 
-def load_maps():
-    """
-    저장된 맵 목록을 로드하거나, 없으면 웹에서 파싱
-    """
+    map_select = soup.find("select", {"id": "filter-map-select"})
+    if not map_select:
+        raise RuntimeError("filter-map-select 셀렉트 태그를 찾을 수 없습니다.")
+
+    maps = []
+    for opt in map_select.find_all("option"):
+        value = opt.get("value", "").strip()
+        title = opt.get("data-title", opt.get_text(strip=True))
+        if value:
+            maps.append({"value": value, "title": title})
+
+    if not maps:
+        raise RuntimeError("맵 옵션을 하나도 파싱하지 못했습니다.")
+
+    map_values = [m["value"] for m in maps]
+    print(f"✅ {len(map_values)}개 맵 파싱 완료: {map_values}")
+
+    # 파싱 결과를 maps.json에 기록(참고용)
     maps_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "maps.json")
-    
-    # 저장된 맵 파일이 있는지 확인
-    if os.path.exists(maps_file):
-        try:
-            with open(maps_file, "r", encoding="utf-8") as f:
-                maps_data = json.load(f)
-            map_values = maps_data.get("map_values", [])
-            print(f"📂 저장된 맵 목록 로드: {len(map_values)}개")
-            if len(map_values) >= MIN_EXPECTED_MAPS:
-                return map_values
-            print("⚠️ 저장된 맵 목록이 충분하지 않아 재파싱 시도")
-        except Exception as e:
-            print(f"⚠️ 맵 파일 로드 실패: {e}")
-    
-    # 저장된 파일이 없거나 로드 실패 시 웹에서 파싱
-    maps = fetch_maps_from_web()
-    
-    if maps and len(maps) >= MIN_EXPECTED_MAPS:
-        return maps
-    if maps:
-        missing = [m for m in DEFAULT_MAPS if m not in maps]
-        if missing:
-            maps = maps + missing
-        return maps
-    
-    # 파싱도 실패한 경우 기본 맵 목록 반환
-    print("⚠️ 기본 하드코딩된 맵 목록 사용")
-    return DEFAULT_MAPS
+    with open(maps_file, "w", encoding="utf-8") as f:
+        json.dump(
+            {"last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "maps": maps, "map_values": map_values},
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+    print(f"💾 맵 정보 저장(참고용): {maps_file}")
+
+    return map_values
 
 def _has_selected_option(soup, value):
     options = soup.find_all("option", {"value": str(value)})
@@ -341,8 +272,8 @@ def main():
     gamemodes = [0, 2] # 0:quickplay, 2:competitive (실패시 1로 자동 폴백)
     regions = ["Americas", "Europe", "Asia"]
     
-    # 웹사이트에서 맵 목록 로드 (또는 저장된 파일에서)
-    maps = load_maps()
+    # 웹사이트에서 맵 목록 동적 파싱 (maps.json 캐시 미사용)
+    maps = fetch_maps_dynamic()
     
     tiers = ["All", "Bronze", "Silver", "Gold", "Platinum", "Diamond", "Master", "Grandmaster"]
 
@@ -359,14 +290,9 @@ def main():
         
         tasks = []
         for gamemode, map_name, tier in product(gamemodes, maps, tiers):
-            # [조건부 건너뛰기]
-            # 빠대(0)인데 티어가 전체가 아니면 스킵
-            if gamemode == 0 and tier != "All": continue
-            
-            # 경쟁전(1,2)에서 특정 맵 스킵 (사용자 원본 로직 유지)
-            # 여기서는 2로 진입하므로 2일 때 검사
-            if gamemode == 2 and map_name in ["volskaya-industries", "temple-of-anubis", "hanamura", "throne-of-anubis", "hanaoka", "antarctic-peninsula"]: continue
-            
+            # 빠른대전(0)은 티어 구분 없음 → All만 수집
+            if gamemode == 0 and tier != "All":
+                continue
             tasks.append((region, gamemode, map_name, tier, date_str))
 
         task_results = {t: [] for t in tasks}

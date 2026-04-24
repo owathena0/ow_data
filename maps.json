@@ -1,29 +1,13 @@
 {
-  "last_updated": "2026-02-12 21:56:23",
+  "last_updated": "2026-04-24 06:42:43",
   "maps": [
     {
       "value": "all-maps",
       "title": "all_maps"
     },
     {
-      "value": "volskaya-industries",
-      "title": "볼스카야 인더스트리"
-    },
-    {
-      "value": "temple-of-anubis",
-      "title": "아누비스 신전"
-    },
-    {
-      "value": "hanamura",
-      "title": "하나무라"
-    },
-    {
-      "value": "throne-of-anubis",
-      "title": "아누비스의 왕좌"
-    },
-    {
-      "value": "hanaoka",
-      "title": "하나오카"
+      "value": "antarctic-peninsula",
+      "title": "남극 반도"
     },
     {
       "value": "nepal",
@@ -140,11 +124,7 @@
   ],
   "map_values": [
     "all-maps",
-    "volskaya-industries",
-    "temple-of-anubis",
-    "hanamura",
-    "throne-of-anubis",
-    "hanaoka",
+    "antarctic-peninsula",
     "nepal",
     "lijiang-tower",
     "busan",
